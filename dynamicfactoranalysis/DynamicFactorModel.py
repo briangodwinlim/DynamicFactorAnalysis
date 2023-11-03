@@ -1441,13 +1441,13 @@ class DynamicFactorModelOptimizer:
         requires it to be any diagonal matrix (uncorrelated errors), and
         "scalar" requires it to be a scalar times the identity matrix. Default
         is "diagonal".
-    error_order : int, optional
-        The order of the vector autoregression followed by the observation
-        error component. Default is None, corresponding to white noise errors.
+    error_order_max : int, optional
+        The maximum order of the vector autoregression followed by the observation
+        error component. Default is 0, corresponding to white noise errors.
     error_var : bool, optional
         Whether or not to model the errors jointly via a vector autoregression,
         rather than as individual autoregressions. Has no effect unless
-        `error_order` is set. Default is False.
+        `error_order_max` is set. Default is False.
     enforce_stationarity : bool, optional
         Whether or not to transform the AR parameters to enforce stationarity
         in the autoregressive component of the model. Default is True.
@@ -1463,7 +1463,7 @@ class DynamicFactorModelOptimizer:
     """
     
     def __init__(self, endog, k_factors_max, factor_lag_max, factor_order_max, exog=None,
-                 error_order=0, error_var=False, error_cov_type='diagonal',
+                 error_order_max=0, error_var=False, error_cov_type='diagonal',
                  enforce_stationarity=True, **kwargs):
                 
         # Model properties
@@ -1474,8 +1474,8 @@ class DynamicFactorModelOptimizer:
         self.factor_lag_max = factor_lag_max
         self.factor_order_max = factor_order_max
                 
-        # Error-related properties (TODO: Add IC-based optimizer for error order)
-        self.error_order = error_order
+        # Error-related properties
+        self.error_order_max = error_order_max
         self.error_var = error_var
         self.error_cov_type = error_cov_type
 
@@ -1512,7 +1512,7 @@ class DynamicFactorModelOptimizer:
         # Compute D statistics
         return np.power((eigenvalues_[r - k - 1] if Dstat == 1 else eigenvalues_[:r - k].sum()) / eigenvalues_.sum(), 0.5)
             
-    def fit(self, factor_ic=2, evolution_ic='aic', Dstat=2, delta=0.1, m=1, verbose=False, **kwargs):        
+    def fit(self, factor_ic=2, evolution_ic='aic', error_ic='aic', Dstat=2, delta=0.1, m=1, verbose=False, **kwargs):        
         """
         Run optimizer for model parameters following Bai & Ng (2007)
 
@@ -1522,6 +1522,8 @@ class DynamicFactorModelOptimizer:
             The information criterion to use in optimizing the number of static factors in Bai & Ng (2002).
         evolution_ic : string, optional
             The information criterion to use in optimizing factor evolution order.
+        error_ic : string, optional
+            The information criterion to use in optimizing error evolution order.
         Dstat : int, optional
             The type of D statistics to use in optimizing the number of dynamic factors in Bai & Ng (2007).
         delta : float, optional
@@ -1531,8 +1533,9 @@ class DynamicFactorModelOptimizer:
         verbose : bool, optional
             Flag indicating whether to print the fitted orders.
         """
-        endog = np.asarray(self.endog)
-        endog = endog[np.logical_not(np.isnan(endog)).any(1)]
+        mask = ~np.any(np.isnan(self.endog), axis=1)
+        endog = np.asarray(self.endog)[mask]
+        exog = np.asarray(self.exog)[mask] if self.exog else None
         T, n = endog.shape
         
         # Determine optimal number of static factors (r)
@@ -1563,10 +1566,26 @@ class DynamicFactorModelOptimizer:
         # Optimize factor lag (cap to factor order - 1) (s)
         self.factor_lag = max(0, min(round(static_factors_ / self.k_factors) - 1, self.factor_order - 1, self.factor_lag_max))
         
+        # Optimize error order
+        res_pca = DynamicPCA(endog, ncomp=self.k_factors, M=self.factor_lag)
+        lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) 
+                                    for p in np.arange(self.factor_lag + 1)])
+        resid = OLS(endog, lagged_factors, missing='drop').fit().resid
+        resid = res_pca._padna(resid, before=self.factor_lag, after=self.factor_lag)
+        resid = OLS(resid, exog, missing='drop').fit().resid if exog else resid
+
+        if self.error_var:
+            self.error_order = VAR(resid).fit(self.error_order_max, trend='n', ic=error_ic).k_ar
+        else:
+            self.error_order = 0
+            for i in range(n):
+                ar_order_ = ar_select_order(resid[:, i], maxlag=self.error_order_max, trend='n', ic=error_ic).ar_lags
+                self.error_order = max(self.error_order, ar_order_[-1]) if ar_order_ else self.error_order
+
         # Print fitted orders
         if verbose:
             print('DynamicFactorModelOptimizer results')
-            print(f'k_factors: {self.k_factors}, factor_lag: {self.factor_lag}, factor_order: {self.factor_order}')
+            print(f'k_factors: {self.k_factors}, factor_lag: {self.factor_lag}, factor_order: {self.factor_order}, error_order: {self.error_order}')
         
         return DynamicFactorModel(self.endog, self.k_factors, self.factor_lag, self.factor_order, exog=self.exog,
                                     error_order=self.error_order, error_var=self.error_var, error_cov_type=self.error_cov_type,
