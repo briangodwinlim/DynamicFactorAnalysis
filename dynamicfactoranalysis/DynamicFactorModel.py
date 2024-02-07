@@ -1,7 +1,7 @@
 """
 Dynamic Factor Model
 
-Author: Brian Godwin Lim
+Authors: Brian Godwin Lim, Mark Kevin Ong Yiu
 Original Author: Chad Fulton (statsmodels)
 """
 
@@ -58,8 +58,14 @@ class DynamicFactorModel(MLEModel):
     enforce_stationarity : bool, optional
         Whether or not to transform the AR parameters to enforce stationarity
         in the autoregressive component of the model. Default is True.
-    loglike_penalty : float, optional
-        Penalty weight for regularized loglikelihood maximization.
+    l1_weight : float or dict, optional
+        Penalty weight for l1-regularized loglikelihood maximization.
+        If dict, keys must be one of 'loadings', 'loadings_lag', 
+        'exog', 'error_cov', 'factor_transition', 'error_transition'.
+    l2_weight : float or dict, optional
+        Penalty weight for l2-regularized loglikelihood maximization.
+        If dict, keys must be one of 'loadings', 'loadings_lag', 
+        'exog', 'error_cov', 'factor_transition', 'error_transition'.
     **kwargs
         Keyword arguments may be used to provide default values for state space
         matrices or for Kalman filtering options. See `Representation`, and
@@ -67,7 +73,7 @@ class DynamicFactorModel(MLEModel):
 
     Attributes
     ----------
-    exog : array_like, optional
+    exog : array_like
         Array of exogenous regressors for the observation equation, shaped
         nobs x k_exog.
     k_factors : int
@@ -87,11 +93,13 @@ class DynamicFactorModel(MLEModel):
         Whether or not to model the errors jointly via a vector autoregression,
         rather than as individual autoregressions. Has no effect unless
         `error_order` is set.
-    enforce_stationarity : bool, optional
+    enforce_stationarity : bool
         Whether or not to transform the AR parameters to enforce stationarity
         in the autoregressive component of the model. Default is True.
-    loglike_penalty : float, optional
-        Penalty weight for regularized loglikelihood maximization.
+    l1_weight : dict
+        Penalty weight for l1-regularized loglikelihood maximization.
+    l2_weight : dict
+        Penalty weight for l2-regularized loglikelihood maximization.
 
     Notes
     -----
@@ -150,7 +158,7 @@ class DynamicFactorModel(MLEModel):
 
     def __init__(self, endog, k_factors, factor_lag, factor_order, exog=None,
                  error_order=0, error_var=False, error_cov_type='diagonal',
-                 enforce_stationarity=True, loglike_penalty=0, **kwargs):
+                 enforce_stationarity=True, l1_weight=0, l2_weight=0, **kwargs):
 
         # Model properties
         self.enforce_stationarity = enforce_stationarity
@@ -173,7 +181,22 @@ class DynamicFactorModel(MLEModel):
         self.mle_regression = self.k_exog > 0
 
         # Loglikelihood penalty
-        self.loglike_penalty = loglike_penalty
+        self._regularize = False
+        self._regularize_keys = ['loadings', 'loadings_lag', 'exog', 'error_cov', 'factor_transition', 'error_transition']
+        
+        if isinstance(l1_weight, (int, float)):
+            self.l1_weight = {key: l1_weight for key in self._regularize_keys}
+        elif isinstance(l1_weight, dict):
+            self.l1_weight = {key: l1_weight.get(key, 0) for key in self._regularize_keys}
+        else:
+            raise ValueError('l1_weight must be a float or dict')
+
+        if isinstance(l2_weight, (int, float)):
+            self.l2_weight = {key: l2_weight for key in self._regularize_keys}
+        elif isinstance(l2_weight, dict):
+            self.l2_weight = {key: l2_weight.get(key, 0) for key in self._regularize_keys}
+        else:
+            raise ValueError('l2_weight must be a float or dict')
 
         # We need to have an array or pandas at this point
         if not _is_using_pandas(endog, None):
@@ -466,12 +489,7 @@ class DynamicFactorModel(MLEModel):
     @property
     def start_params(self):
         params = np.zeros(self.k_params, dtype=np.float64)
-
-        endog = self.endog.copy()
-        mask = ~np.any(np.isnan(endog), axis=1)
-        endog = endog[mask]
-        if self.k_exog > 0:
-            exog = self.exog[mask]
+        endog = pd.DataFrame(self.endog.copy()).interpolate().bfill().to_numpy()
 
         # 1. Factor loadings (estimated via PCA)
         if self.k_factors > 0:
@@ -1004,23 +1022,56 @@ class DynamicFactorModel(MLEModel):
         else:
             self.ssm[self._idx_error_transition] = (
                 params[self._params_error_transition])
-
-    # Penalized loglikelihood for regularization
-    def loglikeobs(self, params, transformed=True, includes_fixed=False, 
-                   complex_step=False, **kwargs):
-        nobs = self.endog.shape[0]
-        burn = self.loglikelihood_burn
-
-        mask = np.hstack([np.zeros(burn), np.ones(nobs - burn)])
-        penalty = mask * self.loglike_penalty * np.sum(np.power(params, 2)) / (nobs - burn)
-        loglikeobs = super().loglikeobs(params=params, transformed=transformed, includes_fixed=includes_fixed, 
-                                        complex_step=complex_step, **kwargs)
-        
-        return loglikeobs - penalty 
-    
-    # Penalized loglikelihood for regularization
+   
     def loglike(self, params, *args, **kwargs):
-        return super().loglike(params, *args, **kwargs) - self.loglike_penalty * np.sum(np.power(params, 2))
+        llf = super().loglike(params, *args, **kwargs)
+        l1_penalty = 0
+        l2_penalty = 0
+
+        for key in self._regularize_keys:
+            slice = getattr(self, f'_params_{key}')
+            l1_penalty += self.l1_weight[key] * np.sum(np.abs(params[slice]))
+            l2_penalty += self.l2_weight[key] * 0.5 * np.sum(np.power(params[slice], 2))
+
+        return llf - (l1_penalty + l2_penalty) * self._regularize
+
+    def score(self, params, *args, **kwargs):
+        sc = super().score(params, *args, **kwargs)
+        l1_penalty = np.zeros_like(sc)
+        l2_penalty = np.zeros_like(sc)
+
+        for key in self._regularize_keys:
+            slice = getattr(self, f'_params_{key}')
+            l1_penalty[slice] += self.l1_weight[key] * np.sign(params[slice])
+            l2_penalty[slice] += self.l2_weight[key] * params[slice]
+
+        return sc - (l1_penalty + l2_penalty) * self._regularize
+
+    def hessian(self, params, *args, **kwargs):
+        hess = super().hessian(params, *args, **kwargs)
+        l2_penalty = np.zeros_like(hess)
+
+        for key in self._regularize_keys:
+            slice = getattr(self, f'_params_{key}')
+            l2_penalty[slice,slice] += self.l2_weight[key] * np.eye(params[slice].shape[0])
+
+        return hess - l2_penalty * self._regularize
+
+    def fit(self, start_params=None, transformed=True, includes_fixed=False,
+            cov_type=None, cov_kwds=None, method='lbfgs', maxiter=50,
+            full_output=1, disp=5, callback=None, return_params=False,
+            optim_score=None, optim_complex_step=None, optim_hessian=None,
+            flags=None, low_memory=False, **kwargs):
+        
+        self._regularize = True
+        res = super().fit(start_params, transformed, includes_fixed,
+                          cov_type, cov_kwds, method, maxiter,
+                          full_output, disp, callback, return_params,
+                          optim_score, optim_complex_step, optim_hessian,
+                          flags, low_memory, **kwargs)
+        self._regularize = False
+        return res
+
 
 class DynamicFactorModelResults(MLEResults):
     """
@@ -1072,7 +1123,8 @@ class DynamicFactorModelResults(MLEResults):
             'k_exog': self.model.k_exog,
             
             # Loglikelihood penalty
-            'loglike_penalty': self.model.loglike_penalty
+            'l1_weight': self.model.l1_weight,
+            'l2_weight': self.model.l2_weight,
         })
 
         # Polynomials / coefficient matrices
@@ -1282,8 +1334,13 @@ class DynamicFactorModelResults(MLEResults):
             error_type = 'VAR' if spec.error_var else 'AR'
             model_name.append('%s(%d) errors' % (error_type, spec.error_order))
 
-        if spec.loglike_penalty != 0:
-            model_name.append('loglike_penalty=%#5.3f' % spec.loglike_penalty)
+        for key in self.model._regularize_keys:
+            if spec.l1_weight[key] != 0:
+                model_name.append('l1_%s=%#5.3f' % (key, spec.l1_weight[key]))
+        
+        for key in self.model._regularize_keys:
+            if spec.l2_weight[key] != 0:
+                model_name.append('l2_%s=%#5.3f' % (key, spec.l2_weight[key]))
 
         summary = super(DynamicFactorModelResults, self).summary(
             alpha=alpha, start=start, model_name=model_name,
@@ -1533,9 +1590,8 @@ class DynamicFactorModelOptimizer:
         verbose : bool, optional
             Flag indicating whether to print the fitted orders.
         """
-        mask = ~np.any(np.isnan(self.endog), axis=1)
-        endog = np.asarray(self.endog)[mask]
-        exog = np.asarray(self.exog)[mask] if self.exog else None
+        endog = pd.DataFrame(self.endog.copy()).interpolate().bfill().to_numpy()
+        exog = self.exog
         T, n = endog.shape
         
         # Determine optimal number of static factors (r)
