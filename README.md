@@ -9,9 +9,11 @@ The current version contains the following implementation
 - `DynamicPCA`
 
   - Implementation of dynamic principal component analysis following Forni et al. (2000), Forni et al. (2005), and Favero et al. (2005). See `examples/DynamicPCA`.
+
 - `DynamicFactorModel`
 
-  - Implementation of the dynamic form of dynamic factor model. The implementation is modified from the statsmodels implementation. See `examples/DynamicFactorModel`.
+  - Implementation of the dynamic form of dynamic factor model. The implementation is modified from the statsmodels implementation with added features for L1 and L2 regularization and mixed-data sampling (MIDAS). See `examples/DynamicFactorModel`.
+
 - `DynamicFactorModelOptimizer`
 
   - Implementation for dynamic factor model order selection following Bai & Ng (2002) and Bai & Ng (2008). See `examples/DynamicFactorModel`.

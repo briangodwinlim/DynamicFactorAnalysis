@@ -5,6 +5,7 @@ Authors: Brian Godwin Lim, Mark Kevin Ong Yiu
 Original Author: Chad Fulton (statsmodels)
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.mlemodel import MLEModel, MLEResults, MLEResultsWrapper
@@ -13,6 +14,7 @@ from statsmodels.tsa.statespace.tools import (
     constrain_stationary_univariate, unconstrain_stationary_univariate,
     constrain_stationary_multivariate, unconstrain_stationary_multivariate
 )
+from statsmodels.genmod.generalized_linear_model import GLM
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tsa.vector_ar.var_model import VAR
 from statsmodels.tsa.ar_model import ar_select_order
@@ -32,7 +34,10 @@ class DynamicFactorModel(MLEModel):
     Parameters
     ----------
     endog : array_like
-        The observed time-series process :math:`y`
+        The observed time-series process :math:`y`.
+    k_endog_q : int, optional
+        The number of quarterly variables in endog. Quarterly variables,
+        if present, should be in the first `k_endog_q` columns of endog.
     exog : array_like, optional
         Array of exogenous regressors for the observation equation, shaped
         nobs x k_exog.
@@ -60,12 +65,12 @@ class DynamicFactorModel(MLEModel):
         in the autoregressive component of the model. Default is True.
     l1_weight : float or dict, optional
         Penalty weight for l1-regularized loglikelihood maximization.
-        If dict, keys must be one of 'loadings', 'loadings_lag', 
-        'exog', 'error_cov', 'factor_transition', 'error_transition'.
+        If dict, keys must be one of 'loadings', 'exog', 'error_cov', 
+        'factor_transition', 'error_transition'.
     l2_weight : float or dict, optional
         Penalty weight for l2-regularized loglikelihood maximization.
-        If dict, keys must be one of 'loadings', 'loadings_lag', 
-        'exog', 'error_cov', 'factor_transition', 'error_transition'.
+        If dict, keys must be one of 'loadings', 'exog', 'error_cov', 
+        'factor_transition', 'error_transition'.
     **kwargs
         Keyword arguments may be used to provide default values for state space
         matrices or for Kalman filtering options. See `Representation`, and
@@ -151,13 +156,16 @@ class DynamicFactorModel(MLEModel):
 
     References
     ----------
-    .. [*] Lütkepohl, Helmut. 2007.
+    .. [1] Lütkepohl, Helmut. 2007.
        New Introduction to Multiple Time Series Analysis.
        Berlin: Springer.
+       [2] Bańbura, Marta, Domenico Giannone, and Lucrezia Reichlin.
+       "Nowcasting."
+       The Oxford Handbook of Economic Forecasting. July 8, 2011.
     """
 
-    def __init__(self, endog, k_factors, factor_lag, factor_order, exog=None,
-                 error_order=0, error_var=False, error_cov_type='diagonal',
+    def __init__(self, endog, k_factors, factor_lag, factor_order, k_endog_q=0, 
+                 exog=None, error_order=0, error_var=False, error_cov_type='diagonal',
                  enforce_stationarity=True, l1_weight=0, l2_weight=0, **kwargs):
 
         # Model properties
@@ -176,13 +184,12 @@ class DynamicFactorModel(MLEModel):
         # Exogenous data
         (self.k_exog, exog) = prepare_exog(exog)
 
-        # Note: at some point in the future might add state regression, as in
-        # SARIMAX.
+        # Note: at some point in the future might add state regression, as in SARIMAX.
         self.mle_regression = self.k_exog > 0
 
         # Loglikelihood penalty
         self._regularize = False
-        self._regularize_keys = ['loadings', 'loadings_lag', 'exog', 'error_cov', 'factor_transition', 'error_transition']
+        self._regularize_keys = ['loadings', 'exog', 'error_cov', 'factor_transition', 'error_transition']
         
         if isinstance(l1_weight, (int, float)):
             self.l1_weight = {key: l1_weight for key in self._regularize_keys}
@@ -204,18 +211,21 @@ class DynamicFactorModel(MLEModel):
 
         # Save some useful model orders, internally used
         k_endog = endog.shape[1] if endog.ndim > 1 else 1
-        self._factor_order = max(1, self.factor_order) * self.k_factors
-        self._error_order = self.error_order * k_endog
+        self.k_endog_q = k_endog_q
+        self.k_endog_m = k_endog - k_endog_q
+        self._factor_lag = max(5 + factor_lag if k_endog_q > 0 else 1 + factor_lag, factor_order)
+        self._error_lag = max(5 if k_endog_q > 0 else 0, error_order)
+        self._factor_order = self._factor_lag * k_factors
+        self._error_order = self._error_lag * k_endog
 
         # Calculate the number of states
         k_states = self._factor_order
         k_posdef = self.k_factors
-        if self.error_order > 0:
+        if self._error_order > 0:
             k_states += self._error_order
             k_posdef += k_endog
 
-        # We can still estimate the model with no dynamic state (e.g. SUR), we
-        # just need to have one state that does nothing.
+        # We can still estimate the model with no dynamic state (e.g. SUR), we just need to have one state that does nothing.
         self._unused_state = False
         if k_states == 0:
             k_states = 1
@@ -224,30 +234,25 @@ class DynamicFactorModel(MLEModel):
 
         # Test for non-multivariate endog
         if k_endog < 2:
-            raise ValueError('The dynamic factors model is only valid for'
-                             ' multivariate time series.')
+            raise ValueError('The dynamic factors model is only valid for multivariate time series.')
 
         # Test for too many factors
         if self.k_factors >= k_endog:
-            raise ValueError('Number of factors must be less than the number'
-                             ' of endogenous variables.')
+            raise ValueError('Number of factors must be less than the number of endogenous variables.')
         
-        # Test for too many factor lags
-        if 1 + factor_lag > max(1, factor_order):
-            raise ValueError('Number of factor lags must be less than the factor order.')
+        # Warning for too many factor lags
+        if self._factor_lag > max(1, factor_order):
+            warnings.warn('effective factor_lag is greater than factor_order.')
 
         # Test for invalid error_cov_type
         if self.error_cov_type not in ['scalar', 'diagonal', 'unstructured']:
-            raise ValueError('Invalid error covariance matrix type'
-                             ' specification.')
+            raise ValueError('Invalid error covariance matrix type specification.')
 
         # By default, initialize as stationary
         kwargs.setdefault('initialization', 'stationary')
 
         # Initialize the state space model
-        super(DynamicFactorModel, self).__init__(
-            endog, exog=exog, k_states=k_states, k_posdef=k_posdef, **kwargs
-        )
+        super(DynamicFactorModel, self).__init__(endog, exog=exog, k_states=k_states, k_posdef=k_posdef, **kwargs)
 
         # Set as time-varying model if we have exog
         if self.k_exog > 0:
@@ -256,7 +261,6 @@ class DynamicFactorModel(MLEModel):
         # Initialize the components
         self.parameters = {}
         self._initialize_loadings()
-        self._initialize_loadings_lag()
         self._initialize_exog()
         self._initialize_error_cov()
         self._initialize_factor_transition()
@@ -272,50 +276,50 @@ class DynamicFactorModel(MLEModel):
 
         offset = 0
         self._params_loadings, offset = _slice('factor_loadings', offset)
-        self._params_loadings_lag, offset = _slice('factor_loadings_lag', offset)
         self._params_exog, offset = _slice('exog', offset)
         self._params_error_cov, offset = _slice('error_cov', offset)
-        self._params_factor_transition, offset = (
-            _slice('factor_transition', offset))
-        self._params_error_transition, offset = (
-            _slice('error_transition', offset))
+        self._params_factor_transition, offset = _slice('factor_transition', offset)
+        self._params_error_transition, offset = _slice('error_transition', offset)
 
         # Update _init_keys attached by super
         self._init_keys += ['k_factors', 'factor_lag', 'factor_order', 'error_order',
-                            'error_var', 'error_cov_type',
-                            'enforce_stationarity'] + list(kwargs.keys())
+                            'error_var', 'error_cov_type', 'enforce_stationarity'] + list(kwargs.keys())
 
     def _initialize_loadings(self):
         # Initialize the parameters
-        self.parameters['factor_loadings'] = self.k_endog * self.k_factors
+        self.parameters['factor_loadings'] = self.k_endog * self.k_factors * (1 + self.factor_lag)
 
         # Setup fixed components of state space matrices
-        if self.error_order > 0:
+        if self._error_lag > 0:
             start = self._factor_order
             end = self._factor_order + self.k_endog
             self.ssm['design', :, start:end] = np.eye(self.k_endog)
 
-        # Setup indices of state space matrices
-        self._idx_loadings = np.s_['design', :, :self.k_factors]
-    
-    def _initialize_loadings_lag(self):
-        # Initialize the parameters
-        self.parameters['factor_loadings_lag'] = self.k_endog * self.k_factors * self.factor_lag
+            for i, m in enumerate([0, 2, 3, 2, 1]): # 1 already updated above
+                start = self._factor_order + i * self.k_endog
+                end = self._factor_order + i * self.k_endog + self.k_endog_q
+                self.ssm['design', :self.k_endog_q, start:end] += m * np.eye(self.k_endog_q)
+                
+            self.ssm['selection', self._factor_order:self._factor_order + self.k_endog, 
+                     self.k_factors:self.k_factors + self.k_endog] = np.eye(self.k_endog)
 
         # Setup indices of state space matrices
-        self._idx_loadings_lag = np.s_['design', :, self.k_factors:self.k_factors * (1 + self.factor_lag)]
+        self._idx_loadings = {
+            'a': [np.s_['design', :, :self._factor_order], np.s_['design', :, :self.k_factors * (1 + self.factor_lag)]],
+            'm': [np.s_['design', self.k_endog_q:, l * self.k_factors:(l + 1) * self.k_factors] for l in range(self._factor_lag)],
+            'q': [np.s_['design', :self.k_endog_q, l * self.k_factors:(l + 1) * self.k_factors] for l in range(self._factor_lag)],
+        }
 
     def _initialize_exog(self):
         # Initialize the parameters
         self.parameters['exog'] = self.k_exog * self.k_endog
 
-        # If we have exog effects, then the obs intercept needs to be
-        # time-varying
+        # If we have exog effects, then the obs intercept needs to be time-varying
         if self.k_exog > 0:
             self.ssm['obs_intercept'] = np.zeros((self.k_endog, self.nobs))
 
         # Setup indices of state space matrices
-        self._idx_exog = np.s_['obs_intercept', :self.k_endog, :]
+        self._idx_exog = np.s_['obs_intercept', :, :]
 
     def _initialize_error_cov(self):
         if self.error_cov_type == 'scalar':
@@ -329,82 +333,62 @@ class DynamicFactorModel(MLEModel):
         # Initialize the parameters
         self.parameters['error_cov'] = 1 if scalar else self.k_endog
 
-        # Setup fixed components of state space matrices
-
         # Setup indices of state space matrices
-        k_endog = self.k_endog
-        k_factors = self.k_factors
-        idx = np.diag_indices(k_endog)
-        if self.error_order > 0:
+        idx = np.diag_indices(self.k_endog)
+        if self._error_lag > 0:
             matrix = 'state_cov'
-            idx = (idx[0] + k_factors, idx[1] + k_factors)
+            idx = (idx[0] + self.k_factors, idx[1] + self.k_factors)
         else:
             matrix = 'obs_cov'
         self._idx_error_cov = (matrix,) + idx
 
     def _initialize_error_cov_unstructured(self):
         # Initialize the parameters
-        k_endog = self.k_endog
-        self.parameters['error_cov'] = int(k_endog * (k_endog + 1) / 2)
-
-        # Setup fixed components of state space matrices
+        self.parameters['error_cov'] = int(self.k_endog * (self.k_endog + 1) / 2)
 
         # Setup indices of state space matrices
         self._idx_lower_error_cov = np.tril_indices(self.k_endog)
-        if self.error_order > 0:
+        if self._error_lag > 0:
             start = self.k_factors
             end = self.k_factors + self.k_endog
-            self._idx_error_cov = (
-                np.s_['state_cov', start:end, start:end])
+            self._idx_error_cov = np.s_['state_cov', start:end, start:end]
         else:
             self._idx_error_cov = np.s_['obs_cov', :, :]
 
     def _initialize_factor_transition(self):
-        order = self.factor_order * self.k_factors
         k_factors = self.k_factors
+        factor_order = self.factor_order
+        _factor_order = self._factor_order
 
         # Initialize the parameters
-        self.parameters['factor_transition'] = (
-            self.factor_order * self.k_factors**2)
+        self.parameters['factor_transition'] = factor_order * k_factors ** 2
 
-        # Setup fixed components of state space matrices
-        # VAR(p) for factor transition
-        if self.k_factors > 0:
-            if self.factor_order > 0:
-                self.ssm['transition', k_factors:order, :order - k_factors] = (
-                    np.eye(order - k_factors))
+        # Setup fixed components of state space matrices VAR(p) for factor transition
+        if k_factors > 0:
+            if _factor_order > 0:
+                self.ssm['transition', k_factors:_factor_order, :_factor_order - k_factors] = np.eye(_factor_order - k_factors)
 
             self.ssm['selection', :k_factors, :k_factors] = np.eye(k_factors)
-            # Identification requires constraining the state covariance to an
-            # identity matrix
+            # Identification requires constraining the state covariance to an identity matrix
             self.ssm['state_cov', :k_factors, :k_factors] = np.eye(k_factors)
 
         # Setup indices of state space matrices
-        self._idx_factor_transition = np.s_['transition', :k_factors, :order]
+        self._idx_factor_transition = np.s_['transition', :k_factors, :factor_order * k_factors]
 
     def _initialize_error_transition(self):
         # Initialize the appropriate situation
         if self.error_order == 0:
             self._initialize_error_transition_white_noise()
         else:
-            # Generic setup fixed components of state space matrices
-            # VAR(q) for error transition
+            # Generic setup fixed components of state space matrices VAR(q) for error transition
             # (in the individual AR case, we still have the VAR(q) companion
-            # matrix structure, but force the coefficient matrices to be
-            # diagonal)
+            # matrix structure, but force the coefficient matrices to be diagonal)
             k_endog = self.k_endog
-            k_factors = self.k_factors
             _factor_order = self._factor_order
             _error_order = self._error_order
-            _slice = np.s_['selection',
-                           _factor_order:_factor_order + k_endog,
-                           k_factors:k_factors + k_endog]
-            self.ssm[_slice] = np.eye(k_endog)
-            _slice = np.s_[
-                'transition',
-                _factor_order + k_endog:_factor_order + _error_order,
-                _factor_order:_factor_order + _error_order - k_endog]
-            self.ssm[_slice] = np.eye(_error_order - k_endog)
+            
+            self.ssm['transition', _factor_order + k_endog:_factor_order + _error_order,
+                     _factor_order:_factor_order + _error_order - k_endog] = np.eye(_error_order - k_endog)
 
             # Now specialized setups
             if self.error_var:
@@ -416,66 +400,51 @@ class DynamicFactorModel(MLEModel):
         # Initialize the parameters
         self.parameters['error_transition'] = 0
 
-        # No fixed components of state space matrices
-
         # Setup indices of state space matrices (just an empty slice)
         self._idx_error_transition = np.s_['transition', 0:0, 0:0]
 
     def _initialize_error_transition_var(self):
         k_endog = self.k_endog
+        error_order = self.error_order
         _factor_order = self._factor_order
-        _error_order = self._error_order
 
         # Initialize the parameters
-        self.parameters['error_transition'] = _error_order * k_endog
-
-        # Fixed components already setup above
+        self.parameters['error_transition'] = error_order * k_endog ** 2
 
         # Setup indices of state space matrices
-        # Here we want to set all of the elements of the coefficient matrices,
-        # the same as in a VAR specification
-        self._idx_error_transition = np.s_[
-            'transition',
-            _factor_order:_factor_order + k_endog,
-            _factor_order:_factor_order + _error_order]
+        # Here we want to set all of the elements of the coefficient matrices, the same as in a VAR specification
+        self._idx_error_transition = np.s_['transition', _factor_order:_factor_order + k_endog,
+                                           _factor_order:_factor_order + error_order * k_endog]
 
     def _initialize_error_transition_individual(self):
         k_endog = self.k_endog
-        _error_order = self._error_order
+        error_order = self.error_order
+        _factor_order = self._factor_order
 
         # Initialize the parameters
-        self.parameters['error_transition'] = _error_order
-
-        # Fixed components already setup above
+        self.parameters['error_transition'] = error_order * k_endog
 
         # Setup indices of state space matrices
-        # Here we want to set only the diagonal elements of the coefficient
-        # matrices, and we want to set them in order by equation, not by
-        # matrix (i.e. set the first element of the first matrix's diagonal,
-        # then set the first element of the second matrix's diagonal, then...)
+        # Here we want to set only the diagonal elements of the coefficient matrices, and we want to set them in order by equation, 
+        # not by matrix (i.e. set the first element of the first matrix's diagonal, then set the first element of the second matrix's diagonal, then...)
 
-        # The basic setup is a tiled list of diagonal indices, one for each
-        # coefficient matrix
-        idx = np.tile(np.diag_indices(k_endog), self.error_order)
+        # The basic setup is a tiled list of diagonal indices, one for each coefficient matrix
+        idx = np.tile(np.diag_indices(k_endog), error_order)
         # Now we need to shift the rows down to the correct location
-        row_shift = self._factor_order
+        row_shift = _factor_order
         # And we need to shift the columns in an increasing way
-        col_inc = self._factor_order + np.repeat(
-            [i * k_endog for i in range(self.error_order)], k_endog)
+        col_inc = _factor_order + np.repeat([i * k_endog for i in range(error_order)], k_endog)
         idx[0] += row_shift
         idx[1] += col_inc
 
-        # Make a copy (without the row shift) so that we can easily get the
-        # diagonal parameters back out of a generic coefficients matrix array
+        # Make a copy (without the row shift) so that we can easily get the diagonal parameters back out of a generic coefficients matrix array
         idx_diag = idx.copy()
-        idx_diag[0] -= row_shift
-        idx_diag[1] -= self._factor_order
+        idx_diag[0] -= _factor_order
+        idx_diag[1] -= _factor_order
         idx_diag = idx_diag[:, np.lexsort((idx_diag[1], idx_diag[0]))]
         self._idx_error_diag = (idx_diag[0], idx_diag[1])
 
-        # Finally, we want to fill the entries in in the correct order, which
-        # is to say we want to fill in lexicographically, first by row then by
-        # column
+        # Finally, we want to fill the entries in in the correct order, which is to say we want to fill in lexicographically, first by row then by column
         idx = idx[:, np.lexsort((idx[1], idx[0]))]
         self._idx_error_transition = np.s_['transition', idx[0], idx[1]]
 
@@ -486,6 +455,34 @@ class DynamicFactorModel(MLEModel):
     def _res_classes(self):
         return {'fit': (DynamicFactorModelResults, DynamicFactorModelResultsWrapper)}
 
+    def loadings_basis(self, loadings):
+        dim = 1 + self.factor_lag
+        multipliers = np.array([1, 2, 3, 2, 1])
+        idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
+        idx_col = np.arange(dim).reshape(-1, 1)
+
+        transform = np.zeros((self._factor_lag, dim))
+        transform[idx_row, idx_col] = multipliers
+        
+        return np.dot(np.linalg.inv(transform[:dim, :]), loadings[:dim, :])
+
+    @property
+    def loadings_constraint(self):
+        dim = 1 + self.factor_lag
+        multipliers = np.array([1, 2, 3, 2, 1])
+        idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
+        idx_col = np.arange(dim).reshape(-1, 1)
+
+        transform = np.zeros((self._factor_lag, dim))
+        transform[idx_row, idx_col] = multipliers
+        
+        R = np.dot(transform[dim:, :], np.linalg.inv(transform[:dim, :]))
+        R = np.concatenate((R, -np.eye(self._factor_lag - dim)), axis=1)
+        R = np.concatenate((R[None, None, :, :] * np.eye(self.k_factors)[:, :, None, None]).T, axis=-1).reshape(-1, self._factor_order)
+        q = np.zeros(R.shape[0])
+        
+        return R, q
+
     @property
     def start_params(self):
         params = np.zeros(self.k_params, dtype=np.float64)
@@ -494,19 +491,29 @@ class DynamicFactorModel(MLEModel):
         # 1. Factor loadings (estimated via PCA)
         if self.k_factors > 0:
             # Use dynamic principal components + OLS as starting values
+            loadings = []
             res_pca = DynamicPCA(endog, ncomp=self.k_factors, M=self.factor_lag)
-            lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) 
-                                        for p in np.arange(self.factor_lag + 1)])
-            mod_ols = OLS(endog, lagged_factors, missing='drop')
-            res_ols = mod_ols.fit()
-
-            # Using OLS params for the loadings
-            params[self._params_loadings] = res_ols.params[:self.k_factors,:].T.ravel()
-            params[self._params_loadings_lag] = res_ols.params[self.k_factors:,:].T.ravel()
-
-            # Update residuals
-            # endog = endog - res_pca._padna(res_pca.project(), before=self.factor_lag, after=self.factor_lag)
-            endog = res_pca._padna(res_ols.resid, before=self.factor_lag, after=self.factor_lag)
+            
+            # Loadings for quarterly variables
+            for i in range(self.k_endog_q):
+                lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(self._factor_lag)])
+                mod_glm = GLM(endog[:, i], lagged_factors, missing='drop')
+                res_glm = mod_glm.fit_constrained(self.loadings_constraint)
+                
+                loadings += self.loadings_basis(res_glm.params.reshape(self._factor_lag, self.k_factors)).flatten().tolist()
+                endog[:, i] = res_pca._padna(np.expand_dims(res_glm.resid_response, axis=-1), before=self.factor_lag + self._factor_lag - 1, after=self.factor_lag).flatten()
+            
+            # Loadings for monthly variables
+            for i in range(self.k_endog_q, self.k_endog):
+                lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(1 + self.factor_lag)])
+                mod_ols = OLS(endog[:, i], lagged_factors, missing='drop')
+                res_ols = mod_ols.fit()
+                
+                loadings += res_ols.params.tolist()
+                endog[:, i] = res_pca._padna(np.expand_dims(res_ols.resid, axis=-1), before=2 * self.factor_lag, after=self.factor_lag).flatten()
+                
+            # Update loadings
+            params[self._params_loadings] = loadings
 
             # Drop missing values
             mask = ~np.any(np.isnan(endog), axis=1)
@@ -527,18 +534,13 @@ class DynamicFactorModel(MLEModel):
         if self.k_factors > 1 and self.factor_order > 0:
             # 3a. VAR transition (OLS on factors estimated via PCA)
             mod_factors = VAR(res_pca.factors)
-            res_factors = mod_factors.fit(maxlags=self.factor_order, ic=None,
-                                          trend='n')
+            res_factors = mod_factors.fit(maxlags=self.factor_order, ic=None, trend='n')
             # Save the parameters
-            params[self._params_factor_transition] = (
-                res_factors.params.T.ravel())
+            params[self._params_factor_transition] = res_factors.params.T.ravel()
 
             # Test for stationarity
-            coefficient_matrices = (
-                params[self._params_factor_transition].reshape(
-                    self.k_factors * self.factor_order, self.k_factors
-                ).T
-            ).reshape(self.k_factors, self.k_factors, self.factor_order).T
+            coefficient_matrices = params[self._params_factor_transition].reshape(self.k_factors * self.factor_order, self.k_factors).T
+            coefficient_matrices = coefficient_matrices.reshape(self.k_factors, self.k_factors, self.factor_order).T
 
             stationary = is_invertible([1] + list(-coefficient_matrices))
         elif self.k_factors > 0 and self.factor_order > 0:
@@ -551,9 +553,7 @@ class DynamicFactorModel(MLEModel):
 
         # Check for stationarity
         if not stationary and self.enforce_stationarity:
-            raise ValueError('Non-stationary starting autoregressive'
-                             ' parameters found with `enforce_stationarity`'
-                             ' set to True.')
+            raise ValueError('Non-stationary starting autoregressive parameters found with `enforce_stationarity` set to True.')
 
         # 4. Errors
         if self.error_order == 0:
@@ -563,52 +563,39 @@ class DynamicFactorModel(MLEModel):
                 params[self._params_error_cov] = endog.var(axis=0)
             elif self.error_cov_type == 'unstructured':
                 cov_factor = np.diag(endog.std(axis=0))
-                params[self._params_error_cov] = (
-                    cov_factor[self._idx_lower_error_cov].ravel())
+                params[self._params_error_cov] = cov_factor[self._idx_lower_error_cov].ravel()
         elif self.error_var:
             mod_errors = VAR(endog)
-            res_errors = mod_errors.fit(maxlags=self.error_order, ic=None,
-                                        trend='n')
+            res_errors = mod_errors.fit(maxlags=self.error_order, ic=None, trend='n')
 
             # Test for stationarity
-            coefficient_matrices = (
-                np.array(res_errors.params.T).ravel().reshape(
-                    self.k_endog * self.error_order, self.k_endog
-                ).T
-            ).reshape(self.k_endog, self.k_endog, self.error_order).T
+            coefficient_matrices = np.array(res_errors.params.T).ravel().reshape(self.k_endog * self.error_order, self.k_endog).T
+            coefficient_matrices = coefficient_matrices.reshape(self.k_endog, self.k_endog, self.error_order).T
 
             stationary = is_invertible([1] + list(-coefficient_matrices))
             if not stationary and self.enforce_stationarity:
-                raise ValueError('Non-stationary starting error autoregressive'
-                                 ' parameters found with'
-                                 ' `enforce_stationarity` set to True.')
+                raise ValueError('Non-stationary starting error autoregressive parameters found with `enforce_stationarity` set to True.')
 
             # Get the error autoregressive parameters
-            params[self._params_error_transition] = (
-                    np.array(res_errors.params.T).ravel())
+            params[self._params_error_transition] = np.array(res_errors.params.T).ravel()
 
             # Get the error covariance parameters
             if self.error_cov_type == 'scalar':
-                params[self._params_error_cov] = (
-                    res_errors.sigma_u.diagonal().mean())
+                params[self._params_error_cov] = res_errors.sigma_u.diagonal().mean()
             elif self.error_cov_type == 'diagonal':
                 params[self._params_error_cov] = res_errors.sigma_u.diagonal()
             elif self.error_cov_type == 'unstructured':
                 try:
                     cov_factor = np.linalg.cholesky(res_errors.sigma_u)
                 except np.linalg.LinAlgError:
-                    cov_factor = np.eye(res_errors.sigma_u.shape[0]) * (
-                        res_errors.sigma_u.diagonal().mean()**0.5)
-                cov_factor = np.eye(res_errors.sigma_u.shape[0]) * (
-                    res_errors.sigma_u.diagonal().mean()**0.5)
-                params[self._params_error_cov] = (
-                    cov_factor[self._idx_lower_error_cov].ravel())
+                    cov_factor = np.eye(res_errors.sigma_u.shape[0]) * (res_errors.sigma_u.diagonal().mean() ** 0.5)
+                cov_factor = np.eye(res_errors.sigma_u.shape[0]) * (res_errors.sigma_u.diagonal().mean() ** 0.5)
+                params[self._params_error_cov] = cov_factor[self._idx_lower_error_cov].ravel()
         else:
             error_ar_params = []
             error_cov_params = []
             for i in range(self.k_endog):
-                mod_error = ARIMA(endog[:, i], order=(self.error_order, 0, 0),
-                                  trend='n', enforce_stationarity=True)
+                mod_error = ARIMA(endog[:, i], order=(self.error_order, 0, 0), trend='n', enforce_stationarity=True)
                 res_error = mod_error.fit(method='burg')
                 error_ar_params += res_error.params[:self.error_order].tolist()
                 error_cov_params += res_error.params[-1:].tolist()
@@ -625,14 +612,9 @@ class DynamicFactorModel(MLEModel):
 
         # 1. Factor loadings (lag)
         param_names += [
-            'loading.f%d.%s' % (j+1, endog_names[i])
+            'loading.L%d.f%d.%s' % (j, k + 1, endog_names[i])
             for i in range(self.k_endog)
-            for j in range(self.k_factors)
-        ]
-        param_names += [
-            'loading.L%d.f%d.%s' % (j+1, k+1, endog_names[i])
-            for i in range(self.k_endog)
-            for j in range(self.factor_lag)
+            for j in range(1 + self.factor_lag)
             for k in range(self.k_factors)
         ]
 
@@ -656,12 +638,12 @@ class DynamicFactorModel(MLEModel):
             param_names += [
                 'cov.chol[%d,%d]' % (i + 1, j + 1)
                 for i in range(self.k_endog)
-                for j in range(i+1)
+                for j in range(i + 1)
             ]
 
         # 4. Factor transition VAR
         param_names += [
-            'L%d.f%d.f%d' % (i+1, k+1, j+1)
+            'L%d.f%d.f%d' % (i + 1, k + 1, j + 1)
             for j in range(self.k_factors)
             for i in range(self.factor_order)
             for k in range(self.k_factors)
@@ -670,14 +652,14 @@ class DynamicFactorModel(MLEModel):
         # 5. Error transition VAR
         if self.error_var:
             param_names += [
-                'L%d.e(%s).e(%s)' % (i+1, endog_names[k], endog_names[j])
+                'L%d.e(%s).e(%s)' % (i + 1, endog_names[k], endog_names[j])
                 for j in range(self.k_endog)
                 for i in range(self.error_order)
                 for k in range(self.k_endog)
             ]
         else:
             param_names += [
-                'L%d.e(%s).e(%s)' % (i+1, endog_names[j], endog_names[j])
+                'L%d.e(%s).e(%s)' % (i + 1, endog_names[j], endog_names[j])
                 for j in range(self.k_endog)
                 for i in range(self.error_order)
             ]
@@ -691,15 +673,14 @@ class DynamicFactorModel(MLEModel):
 
         # Factors and lags
         names += [
-            (('f%d' % (j + 1)) if i == 0 else ('f%d.L%d' % (j + 1, i)))
-            for i in range(max(1, self.factor_order))
+            ('f%d' % (j + 1)) if i == 0 else ('f%d.L%d' % (j + 1, i))
+            for i in range(self._factor_lag)
             for j in range(self.k_factors)]
 
-        if self.error_order > 0:
+        if self._error_lag > 0:
             names += [
-                (('e(%s)' % endog_names[j]) if i == 0
-                 else ('e(%s).L%d' % (endog_names[j], i)))
-                for i in range(self.error_order)
+                ('e(%s)' % endog_names[j]) if i == 0 else ('e(%s).L%d' % (endog_names[j], i))
+                for i in range(self._error_lag)
                 for j in range(self.k_endog)]
 
         if self._unused_state:
@@ -715,19 +696,16 @@ class DynamicFactorModel(MLEModel):
         Parameters
         ----------
         unconstrained : array_like
-            Array of unconstrained parameters used by the optimizer, to be
-            transformed.
+            Array of unconstrained parameters used by the optimizer, to be transformed.
 
         Returns
         -------
         constrained : array_like
-            Array of constrained parameters which may be used in likelihood
-            evaluation.
+            Array of constrained parameters which may be used in likelihood evaluation.
 
         Notes
         -----
-        Constrains the factor transition to be stationary and variances to be
-        positive.
+        Constrains the factor transition to be stationary and variances to be positive.
         """
         unconstrained = np.array(unconstrained, ndmin=1)
         dtype = unconstrained.dtype
@@ -735,76 +713,56 @@ class DynamicFactorModel(MLEModel):
 
         # 1. Factor loadings
         # The factor loadings (lag) do not need to be adjusted
-        constrained[self._params_loadings] = (
-            unconstrained[self._params_loadings])
-        constrained[self._params_loadings_lag] = (
-            unconstrained[self._params_loadings_lag])
+        constrained[self._params_loadings] = unconstrained[self._params_loadings]
 
         # 2. Exog
         # The regression coefficients do not need to be adjusted
-        constrained[self._params_exog] = (
-            unconstrained[self._params_exog])
+        constrained[self._params_exog] = unconstrained[self._params_exog]
 
         # 3. Error covariances
         # If we have variances, force them to be positive
         if self.error_cov_type in ['scalar', 'diagonal']:
-            constrained[self._params_error_cov] = (
-                unconstrained[self._params_error_cov]**2)
+            constrained[self._params_error_cov] = unconstrained[self._params_error_cov] ** 2
         # Otherwise, nothing needs to be done
         elif self.error_cov_type == 'unstructured':
-            constrained[self._params_error_cov] = (
-                unconstrained[self._params_error_cov])
+            constrained[self._params_error_cov] = unconstrained[self._params_error_cov]
 
         # 4. Factor transition VAR
         # VAR transition: optionally force to be stationary
         if self.enforce_stationarity and self.factor_order > 0:
             # Transform the parameters
-            unconstrained_matrices = (
-                unconstrained[self._params_factor_transition].reshape(
-                    self.k_factors, self._factor_order))
+            unconstrained_matrices = unconstrained[self._params_factor_transition].reshape(self.k_factors, self.factor_order * self.k_factors)
             # This is always an identity matrix, but because the transform
             # done prior to update (where the ssm representation matrices
             # change), it may be complex
             cov = self.ssm['state_cov', :self.k_factors, :self.k_factors].real
-            coefficient_matrices, variance = (
-                constrain_stationary_multivariate(unconstrained_matrices, cov))
-            constrained[self._params_factor_transition] = (
-                coefficient_matrices.ravel())
+            coefficient_matrices, variance = constrain_stationary_multivariate(unconstrained_matrices, cov)
+            constrained[self._params_factor_transition] = coefficient_matrices.ravel()
         else:
-            constrained[self._params_factor_transition] = (
-                unconstrained[self._params_factor_transition])
+            constrained[self._params_factor_transition] = unconstrained[self._params_factor_transition]
 
         # 5. Error transition VAR
         # VAR transition: optionally force to be stationary
         if self.enforce_stationarity and self.error_order > 0:
-
             # Joint VAR specification
             if self.error_var:
-                unconstrained_matrices = (
-                    unconstrained[self._params_error_transition].reshape(
-                        self.k_endog, self._error_order))
+                unconstrained_matrices = unconstrained[self._params_error_transition].reshape(self.k_endog, self.error_order * self.k_endog)
                 start = self.k_factors
                 end = self.k_factors + self.k_endog
                 cov = self.ssm['state_cov', start:end, start:end].real
-                coefficient_matrices, variance = (
-                    constrain_stationary_multivariate(
-                        unconstrained_matrices, cov))
-                constrained[self._params_error_transition] = (
-                    coefficient_matrices.ravel())
+                coefficient_matrices, variance = constrain_stationary_multivariate(unconstrained_matrices, cov)
+                constrained[self._params_error_transition] = coefficient_matrices.ravel()
             # Separate AR specifications
             else:
-                coefficients = (
-                    unconstrained[self._params_error_transition].copy())
+                coefficients = unconstrained[self._params_error_transition].copy()
                 for i in range(self.k_endog):
                     start = i * self.error_order
                     end = (i + 1) * self.error_order
-                    coefficients[start:end] = constrain_stationary_univariate(
-                        coefficients[start:end])
+                    coefficients[start:end] = constrain_stationary_univariate(coefficients[start:end])
                 constrained[self._params_error_transition] = coefficients
 
         else:
-            constrained[self._params_error_transition] = (
-                unconstrained[self._params_error_transition])
+            constrained[self._params_error_transition] = unconstrained[self._params_error_transition]
 
         return constrained
 
@@ -816,8 +774,7 @@ class DynamicFactorModel(MLEModel):
         Parameters
         ----------
         constrained : array_like
-            Array of constrained parameters used in likelihood evaluation, to
-            be transformed.
+            Array of constrained parameters used in likelihood evaluation, to be transformed.
 
         Returns
         -------
@@ -830,75 +787,53 @@ class DynamicFactorModel(MLEModel):
 
         # 1. Factor loadings
         # The factor loadings (lag) do not need to be adjusted
-        unconstrained[self._params_loadings] = (
-            constrained[self._params_loadings])
-        unconstrained[self._params_loadings_lag] = (
-            constrained[self._params_loadings_lag])
+        unconstrained[self._params_loadings] = constrained[self._params_loadings]
         
         # 2. Exog
         # The regression coefficients do not need to be adjusted
-        unconstrained[self._params_exog] = (
-            constrained[self._params_exog])
+        unconstrained[self._params_exog] = constrained[self._params_exog]
 
         # 3. Error covariances
         # If we have variances, force them to be positive
         if self.error_cov_type in ['scalar', 'diagonal']:
-            unconstrained[self._params_error_cov] = (
-                constrained[self._params_error_cov]**0.5)
+            unconstrained[self._params_error_cov] = constrained[self._params_error_cov] ** 0.5
         # Otherwise, nothing needs to be done
         elif self.error_cov_type == 'unstructured':
-            unconstrained[self._params_error_cov] = (
-                constrained[self._params_error_cov])
+            unconstrained[self._params_error_cov] = constrained[self._params_error_cov]
 
         # 3. Factor transition VAR
         # VAR transition: optionally force to be stationary
         if self.enforce_stationarity and self.factor_order > 0:
             # Transform the parameters
-            constrained_matrices = (
-                constrained[self._params_factor_transition].reshape(
-                    self.k_factors, self._factor_order))
+            constrained_matrices = constrained[self._params_factor_transition].reshape(self.k_factors, self.factor_order * self.k_factors)
             cov = self.ssm['state_cov', :self.k_factors, :self.k_factors].real
-            coefficient_matrices, variance = (
-                unconstrain_stationary_multivariate(
-                    constrained_matrices, cov))
-            unconstrained[self._params_factor_transition] = (
-                coefficient_matrices.ravel())
+            coefficient_matrices, variance = unconstrain_stationary_multivariate(constrained_matrices, cov)
+            unconstrained[self._params_factor_transition] = coefficient_matrices.ravel()
         else:
-            unconstrained[self._params_factor_transition] = (
-                constrained[self._params_factor_transition])
+            unconstrained[self._params_factor_transition] = constrained[self._params_factor_transition]
 
         # 5. Error transition VAR
         # VAR transition: optionally force to be stationary
         if self.enforce_stationarity and self.error_order > 0:
-
             # Joint VAR specification
             if self.error_var:
-                constrained_matrices = (
-                    constrained[self._params_error_transition].reshape(
-                        self.k_endog, self._error_order))
+                constrained_matrices = constrained[self._params_error_transition].reshape(self.k_endog, self.error_order * self.k_endog)
                 start = self.k_factors
                 end = self.k_factors + self.k_endog
                 cov = self.ssm['state_cov', start:end, start:end].real
-                coefficient_matrices, variance = (
-                    unconstrain_stationary_multivariate(
-                        constrained_matrices, cov))
-                unconstrained[self._params_error_transition] = (
-                    coefficient_matrices.ravel())
+                coefficient_matrices, variance = unconstrain_stationary_multivariate(constrained_matrices, cov)
+                unconstrained[self._params_error_transition] = coefficient_matrices.ravel()
             # Separate AR specifications
             else:
-                coefficients = (
-                    constrained[self._params_error_transition].copy())
+                coefficients = constrained[self._params_error_transition].copy()
                 for i in range(self.k_endog):
                     start = i * self.error_order
                     end = (i + 1) * self.error_order
-                    coefficients[start:end] = (
-                        unconstrain_stationary_univariate(
-                            coefficients[start:end]))
+                    coefficients[start:end] = unconstrain_stationary_univariate(coefficients[start:end])
                 unconstrained[self._params_error_transition] = coefficients
 
         else:
-            unconstrained[self._params_error_transition] = (
-                constrained[self._params_error_transition])
+            unconstrained[self._params_error_transition] = constrained[self._params_error_transition]
 
         return unconstrained
 
@@ -906,14 +841,13 @@ class DynamicFactorModel(MLEModel):
         super(DynamicFactorModel, self)._validate_can_fix_params(param_names)
 
         ix = np.cumsum(list(self.parameters.values()))[:-1]
-        (_, _, _, _, factor_transition_names, error_transition_names) = [
+        (_, _, _, factor_transition_names, error_transition_names) = [
             arr.tolist() for arr in np.array_split(self.param_names, ix)]
 
         if self.enforce_stationarity and self.factor_order > 0:
             if self.k_factors > 1 or self.factor_order > 1:
                 fix_all = param_names.issuperset(factor_transition_names)
-                fix_any = (
-                    len(param_names.intersection(factor_transition_names)) > 0)
+                fix_any = len(param_names.intersection(factor_transition_names)) > 0
                 if fix_any and not fix_all:
                     raise ValueError(
                         'Cannot fix individual factor transition parameters'
@@ -923,8 +857,7 @@ class DynamicFactorModel(MLEModel):
         if self.enforce_stationarity and self.error_order > 0:
             if self.error_var or self.error_order > 1:
                 fix_all = param_names.issuperset(error_transition_names)
-                fix_any = (
-                    len(param_names.intersection(error_transition_names)) > 0)
+                fix_any = len(param_names.intersection(error_transition_names)) > 0
                 if fix_any and not fix_all:
                     raise ValueError(
                         'Cannot fix individual error transition parameters'
@@ -932,8 +865,7 @@ class DynamicFactorModel(MLEModel):
                         ' must either fix all error transition parameters or'
                         ' none.')
 
-    def update(self, params, transformed=True, includes_fixed=False,
-               complex_step=False):
+    def update(self, params, transformed=True, includes_fixed=False, complex_step=False):
         """
         Update the parameters of the model
 
@@ -957,15 +889,12 @@ class DynamicFactorModel(MLEModel):
         -----
         Let `n = k_endog`, `m = k_factors`, `q = factor_lag`, and `p = factor_order`. 
         Then the `params` vector has length
-        :math:`[n \times m] + [n \times m \times q] + [n] + [m^2 \times p]`.
+        :math:`[n \times m \times (1 + q)] + [n] + [m^2 \times p]`.
         It is expanded in the following way:
 
-        - The first :math:`n \times m` parameters fill out the factor loading
+        - The first :math:`n \times m \times (1 + q)` parameters fill out the factor loading
           matrix, starting from the [0,0] entry and then proceeding along rows.
           These parameters are not modified in `transform_params`.
-        - The next :math:`n \times m \times q` parameters fill out the factor loading
-          matrix for the lagged factors, starting from the [0,m] entry and then proceeding 
-          along rows. These parameters are not modified in `transform_params`.
         - The next :math:`n` parameters provide variances for the error_cov
           errors in the observation equation. They fill in the diagonal of the
           observation covariance matrix, and are constrained to be positive by
@@ -979,49 +908,40 @@ class DynamicFactorModel(MLEModel):
           coefficient matrix (starting at [0,0] and filling along rows), the
           second :math:`m^2` parameters fill the second matrix, etc.
         """
-        params = self.handle_params(params, transformed=transformed,
-                                    includes_fixed=includes_fixed)
+        params = self.handle_params(params, transformed=transformed, includes_fixed=includes_fixed)
 
         # 1. Factor loadings
         # Update the design / factor loading (lag) matrix
-        self.ssm[self._idx_loadings] = (
-            params[self._params_loadings].reshape(self.k_endog, self.k_factors)
-        )
-        self.ssm[self._idx_loadings_lag] = (
-            params[self._params_loadings_lag].reshape(self.k_endog, self.k_factors * self.factor_lag)
-        )
+        self.ssm[self._idx_loadings['a'][0]] = 0
+        params_loadings = params[self._params_loadings].reshape(self.k_endog, (1 + self.factor_lag) * self.k_factors)
+        self.ssm[self._idx_loadings['a'][1]] = params_loadings
+        
+        if self.k_endog_q > 0:
+            for i in range(1 + self.factor_lag):
+                for l, m in enumerate([0, 2, 3, 2, 1]): # 1 already updated above
+                    self.ssm[self._idx_loadings['q'][l + i]] += m * params_loadings[:self.k_endog_q, i * self.k_factors:(i + 1) * self.k_factors]
 
         # 2. Exog
         if self.k_exog > 0:
-            exog_params = params[self._params_exog].reshape(
-                self.k_endog, self.k_exog).T
+            exog_params = params[self._params_exog].reshape(self.k_endog, self.k_exog).T
             self.ssm[self._idx_exog] = np.dot(self.exog, exog_params).T
 
         # 3. Error covariances
         if self.error_cov_type in ['scalar', 'diagonal']:
-            self.ssm[self._idx_error_cov] = (
-                params[self._params_error_cov])
+            self.ssm[self._idx_error_cov] = params[self._params_error_cov]
         elif self.error_cov_type == 'unstructured':
-            error_cov_lower = np.zeros((self.k_endog, self.k_endog),
-                                       dtype=params.dtype)
-            error_cov_lower[self._idx_lower_error_cov] = (
-                params[self._params_error_cov])
-            self.ssm[self._idx_error_cov] = (
-                np.dot(error_cov_lower, error_cov_lower.T))
+            error_cov_lower = np.zeros((self.k_endog, self.k_endog), dtype=params.dtype)
+            error_cov_lower[self._idx_lower_error_cov] = params[self._params_error_cov]
+            self.ssm[self._idx_error_cov] = np.dot(error_cov_lower, error_cov_lower.T)
 
         # 4. Factor transition VAR
-        self.ssm[self._idx_factor_transition] = (
-            params[self._params_factor_transition].reshape(
-                self.k_factors, self.factor_order * self.k_factors))
+        self.ssm[self._idx_factor_transition] = params[self._params_factor_transition].reshape(self.k_factors, self.factor_order * self.k_factors)
 
         # 5. Error transition VAR
         if self.error_var:
-            self.ssm[self._idx_error_transition] = (
-                params[self._params_error_transition].reshape(
-                    self.k_endog, self._error_order))
+            self.ssm[self._idx_error_transition] = params[self._params_error_transition].reshape(self.k_endog, self.error_order * self.k_endog)
         else:
-            self.ssm[self._idx_error_transition] = (
-                params[self._params_error_transition])
+            self.ssm[self._idx_error_transition] = params[self._params_error_transition]
    
     def loglike(self, params, *args, **kwargs):
         llf = super().loglike(params, *args, **kwargs)
@@ -1096,17 +1016,16 @@ class DynamicFactorModelResults(MLEResults):
     statsmodels.tsa.statespace.kalman_filter.FilterResults
     statsmodels.tsa.statespace.mlemodel.MLEResults
     """
-    def __init__(self, model, params, filter_results, cov_type=None,
-                 **kwargs):
-        super(DynamicFactorModelResults, self).__init__(model, params,
-                                                   filter_results, cov_type,
-                                                   **kwargs)
+    def __init__(self, model, params, filter_results, cov_type=None, **kwargs):
+        super(DynamicFactorModelResults, self).__init__(model, params, filter_results, cov_type, **kwargs)
 
         self.df_resid = np.inf  # attribute required for wald tests
 
         self.specification = Bunch(**{
             # Model properties
             'k_endog': self.model.k_endog,
+            'k_endog_q': self.model.k_endog_q,
+            'k_endog_m': self.model.k_endog_m,
             'enforce_stationarity': self.model.enforce_stationarity,
 
             # Factor-related properties
@@ -1130,29 +1049,24 @@ class DynamicFactorModelResults(MLEResults):
         # Polynomials / coefficient matrices
         self.coefficient_matrices_var = None
         if self.model.factor_order > 0:
-            ar_params = (
-                np.array(self.params[self.model._params_factor_transition]))
+            ar_params = np.array(self.params[self.model._params_factor_transition])
             k_factors = self.model.k_factors
             factor_order = self.model.factor_order
-            self.coefficient_matrices_var = (
-                ar_params.reshape(k_factors * factor_order, k_factors).T
-            ).reshape(k_factors, k_factors, factor_order).T
+            self.coefficient_matrices_var = ar_params.reshape(k_factors * factor_order, k_factors).T
+            self.coefficient_matrices_var = self.coefficient_matrices_var.reshape(k_factors, k_factors, factor_order).T
 
         self.coefficient_matrices_error = None
         if self.model.error_order > 0:
-            ar_params = (
-                np.array(self.params[self.model._params_error_transition]))
+            ar_params = np.array(self.params[self.model._params_error_transition])
             k_endog = self.model.k_endog
             error_order = self.model.error_order
             if self.model.error_var:
-                self.coefficient_matrices_error = (
-                    ar_params.reshape(k_endog * error_order, k_endog).T
-                ).reshape(k_endog, k_endog, error_order).T
+                self.coefficient_matrices_error = ar_params.reshape(k_endog * error_order, k_endog).T
+                self.coefficient_matrices_error = self.coefficient_matrices_error.reshape(k_endog, k_endog, error_order).T
             else:
                 mat = np.zeros((k_endog, k_endog * error_order))
                 mat[self.model._idx_error_diag] = ar_params
-                self.coefficient_matrices_error = (
-                    mat.T.reshape(error_order, k_endog, k_endog))
+                self.coefficient_matrices_error = mat.T.reshape(error_order, k_endog, k_endog)
 
     @property
     def factors(self):
@@ -1194,8 +1108,7 @@ class DynamicFactorModelResults(MLEResults):
             if self.smoothed_state is not None:
                 out.smoothed = self.smoothed_state[offset:end]
             if self.smoothed_state_cov is not None:
-                out.smoothed_cov = (
-                    self.smoothed_state_cov[offset:end, offset:end])
+                out.smoothed_cov = self.smoothed_state_cov[offset:end, offset:end]
         return out
 
     @cache_readonly
@@ -1231,11 +1144,14 @@ class DynamicFactorModelResults(MLEResults):
         spec = self.specification
         coefficients = np.zeros((spec.k_endog, spec.k_factors))
         which = 'filtered' if self.smoothed_state is None else 'smoothed'
+        
+        # TODO: Adjust for quarterly variables
+        if spec.k_endog_q > 0:
+            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
 
         def lag_factors(exog, lags):
             res_pca = DynamicPCA(np.random.rand(10, 10))
-            return np.hstack([res_pca._shift(exog, periods=l, pad=np.nan) 
-                                    for l in np.arange(lags + 1)])
+            return np.hstack([res_pca._shift(exog, periods=l, pad=np.nan) for l in np.arange(lags + 1)])
 
         for i in range(spec.k_factors):
             exog = lag_factors(self.factors[which][i], spec.factor_lag)
@@ -1246,8 +1162,7 @@ class DynamicFactorModelResults(MLEResults):
 
         return coefficients
 
-    def plot_coefficients_of_determination(self, endog_labels=None,
-                                           fig=None, figsize=None):
+    def plot_coefficients_of_determination(self, endog_labels=None, fig=None, figsize=None):
         """
         Plot the coefficients of determination
 
@@ -1282,6 +1197,10 @@ class DynamicFactorModelResults(MLEResults):
         fig = create_mpl_fig(fig, figsize)
 
         spec = self.specification
+        
+        # TODO: Adjust for quarterly variables
+        if spec.k_endog_q > 0:
+            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
 
         # Should we label endogenous variables?
         if endog_labels is None:
@@ -1319,8 +1238,12 @@ class DynamicFactorModelResults(MLEResults):
         model_name = []
         if spec.k_factors > 0:
             if spec.factor_order > 0:
-                model_type = ('DynamicFactorModel(factors=%d, lag=%d, order=%d)' %
-                              (spec.k_factors, spec.factor_lag, spec.factor_order))
+                if spec.k_endog_q > 0:
+                    model_type = ('DynamicFactorModelMQ(factors=%d, lag=%d, order=%d)' %
+                                  (spec.k_factors, spec.factor_lag, spec.factor_order))
+                else:
+                    model_type = ('DynamicFactorModel(factors=%d, lag=%d, order=%d)' %
+                                  (spec.k_factors, spec.factor_lag, spec.factor_order))
             else:
                 model_type = 'StaticFactor(factors=%d)' % spec.k_factors
 
@@ -1329,6 +1252,9 @@ class DynamicFactorModelResults(MLEResults):
                 model_name.append('%d regressors' % spec.k_exog)
         else:
             model_name.append('SUR(%d regressors)' % spec.k_exog)
+
+        if spec.k_endog_q > 0:
+            model_name.append('k_endog_q=%d' % (spec.k_endog_q))
 
         if spec.error_order > 0:
             error_type = 'VAR' if spec.error_var else 'AR'
@@ -1375,24 +1301,15 @@ class DynamicFactorModelResults(MLEResults):
             # Add parameter tables for each endogenous variable
             loading_indices = indices[self.model._params_loadings]
             loading_masks = []
-            loading_lag_indices = indices[self.model._params_loadings_lag]
-            loading_lag_masks = []
             exog_indices = indices[self.model._params_exog]
             exog_masks = []
             for i in range(k_endog):
                 # 1. Factor loadings
                 # Recall these are in the form:
-                # 'loading.f1.y1', 'loading.f2.y1', 'loading.f1.y2', ...
-                loading_mask = (
-                    loading_indices[i * k_factors:(i + 1) * k_factors])
+                # 'loading.L0.f1.y1', 'loading.L0.f2.y1', 'loading.L0.f1.y2', ...
+                order = k_factors * (1 + factor_lag)
+                loading_mask = loading_indices[i * order:(i + 1) * order]
                 loading_masks.append(loading_mask)
-
-                # 1. Factor loadings lag
-                # Recall these are in the form:
-                # 'loading.L1.f1.y1', 'loading.L1.f2.y1', 'loading.L1.f1.y2', ...
-                loading_lag_mask = (
-                    loading_lag_indices[i * k_factors * factor_lag:(i + 1) * k_factors * factor_lag])
-                loading_lag_masks.append(loading_lag_mask)
 
                 # 2. Exog
                 # Recall these are in the form:
@@ -1401,7 +1318,7 @@ class DynamicFactorModelResults(MLEResults):
                 exog_masks.append(exog_mask)
 
                 # Create the table
-                mask = np.concatenate([loading_mask, loading_lag_mask, exog_mask])
+                mask = np.concatenate([loading_mask, exog_mask])
                 title = "Results for equation %s" % self.model.endog_names[i]
                 table = make_table(self, mask, title)
                 summary.tables.append(table)
@@ -1411,8 +1328,7 @@ class DynamicFactorModelResults(MLEResults):
             factor_masks = []
             if factor_order > 0:
                 for i in range(k_factors):
-                    start = i * _factor_order
-                    factor_mask = factor_indices[start: start + _factor_order]
+                    factor_mask = factor_indices[i * _factor_order:(i + 1) * _factor_order]
                     factor_masks.append(factor_mask)
 
                     # Create the table
@@ -1436,29 +1352,25 @@ class DynamicFactorModelResults(MLEResults):
                     error_masks.append(error_mask)
 
                     # Create the table
-                    title = ("Results for error equation e(%s)" %
-                             self.model.endog_names[i])
+                    title = ("Results for error equation e(%s)" % self.model.endog_names[i])
                     table = make_table(self, error_mask, title)
                     summary.tables.append(table)
 
             # Error covariance terms
             error_cov_mask = indices[self.model._params_error_cov]
-            table = make_table(self, error_cov_mask,
-                               "Error covariance matrix", strip_end=False)
+            table = make_table(self, error_cov_mask, "Error covariance matrix", strip_end=False)
             summary.tables.append(table)
 
             # Add a table for all other parameters
             masks = []
-            for m in (loading_masks, loading_lag_masks, exog_masks, factor_masks,
-                      error_masks, [error_cov_mask]):
+            for m in (loading_masks, exog_masks, factor_masks, error_masks, [error_cov_mask]):
                 m = np.array(m).flatten()
                 if len(m) > 0:
                     masks.append(m)
             masks = np.concatenate(masks)
             inverse_mask = np.array(list(set(indices).difference(set(masks))))
             if len(inverse_mask) > 0:
-                table = make_table(self, inverse_mask, "Other parameters",
-                                   strip_end=False)
+                table = make_table(self, inverse_mask, "Other parameters", strip_end=False)
                 summary.tables.append(table)
 
         return summary
@@ -1482,7 +1394,10 @@ class DynamicFactorModelOptimizer:
     Parameters
     ----------
     endog : array_like
-        The observed time-series process :math:`y`
+        The observed time-series process :math:`y`.
+    k_endog_q : int, optional
+        The number of quarterly variables in endog. Quarterly variables,
+        if present, should be in the first `k_endog_q` columns of endog.
     exog : array_like, optional
         Array of exogenous regressors for the observation equation, shaped
         nobs x k_exog.
@@ -1509,9 +1424,9 @@ class DynamicFactorModelOptimizer:
         Whether or not to transform the AR parameters to enforce stationarity
         in the autoregressive component of the model. Default is True.
     **kwargs
-        Keyword arguments may be used to provide default values for state space
-        matrices or for Kalman filtering options. See `Representation`, and
-        `KalmanFilter` for more details.
+        Keyword arguments for the resulting DynamicFactorModel, e.g. 
+        l1_weight, l2_weight, kwargs for state space matrices or for 
+        Kalman filtering options. See DynamicFactorModel.
         
     References
     ----------
@@ -1519,8 +1434,8 @@ class DynamicFactorModelOptimizer:
         Bai & Ng (2007)
     """
     
-    def __init__(self, endog, k_factors_max, factor_lag_max, factor_order_max, exog=None,
-                 error_order_max=0, error_var=False, error_cov_type='diagonal',
+    def __init__(self, endog, k_factors_max, factor_lag_max, factor_order_max, k_endog_q=0,
+                 exog=None, error_order_max=0, error_var=False, error_cov_type='diagonal',
                  enforce_stationarity=True, **kwargs):
                 
         # Model properties
@@ -1537,11 +1452,15 @@ class DynamicFactorModelOptimizer:
         self.error_cov_type = error_cov_type
 
         # Data
+        self.k_endog_q = k_endog_q
         self.endog = endog
         self.exog = exog
         
         # Kwargs
         self.kwargs = kwargs
+        
+        if k_endog_q > 0:
+            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
         
     def _factor_ic(self, endog, k_factors, factor_ic):    # Bai & Ng (2002)
         if k_factors == 0: 
@@ -1549,6 +1468,7 @@ class DynamicFactorModelOptimizer:
         
         # Factor loadings (estimated via PCA)
         factors = DynamicPCA(endog, ncomp=k_factors, M=0, missing='fill-em').factors
+        # TODO: Adjust for quarterly variables
         error = OLS(endog, factors).fit().resid
         mean_squared_error_ = np.mean(np.power(error, 2))
         
@@ -1643,6 +1563,6 @@ class DynamicFactorModelOptimizer:
             print('DynamicFactorModelOptimizer results')
             print(f'k_factors: {self.k_factors}, factor_lag: {self.factor_lag}, factor_order: {self.factor_order}, error_order: {self.error_order}')
         
-        return DynamicFactorModel(self.endog, self.k_factors, self.factor_lag, self.factor_order, exog=self.exog,
+        return DynamicFactorModel(self.endog, self.k_factors, self.factor_lag, self.factor_order, k_endog_q=self.k_endog_q, exog=self.exog,
                                     error_order=self.error_order, error_var=self.error_var, error_cov_type=self.error_cov_type,
                                     enforce_stationarity=self.enforce_stationarity, **self.kwargs)
