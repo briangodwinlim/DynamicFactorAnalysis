@@ -582,7 +582,7 @@ class DynamicPCA:
         if isinstance(array, pd.DataFrame):
             return array.dropna()
         else:
-            return array[np.logical_not(np.isnan(array)).any(axis=1)]
+            return array[np.logical_not(np.isnan(array).any(axis=1))]
     
     # Row-level forward fill
     def _ffill(self, array):

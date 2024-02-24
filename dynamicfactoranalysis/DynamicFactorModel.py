@@ -289,20 +289,6 @@ class DynamicFactorModel(MLEModel):
         # Initialize the parameters
         self.parameters['factor_loadings'] = self.k_endog * self.k_factors * (1 + self.factor_lag)
 
-        # Setup fixed components of state space matrices
-        if self._error_lag > 0:
-            start = self._factor_order
-            end = self._factor_order + self.k_endog
-            self.ssm['design', :, start:end] = np.eye(self.k_endog)
-
-            for i, m in enumerate([0, 2, 3, 2, 1]): # 1 already updated above
-                start = self._factor_order + i * self.k_endog
-                end = self._factor_order + i * self.k_endog + self.k_endog_q
-                self.ssm['design', :self.k_endog_q, start:end] += m * np.eye(self.k_endog_q)
-                
-            self.ssm['selection', self._factor_order:self._factor_order + self.k_endog, 
-                     self.k_factors:self.k_factors + self.k_endog] = np.eye(self.k_endog)
-
         # Setup indices of state space matrices
         self._idx_loadings = {
             'a': [np.s_['design', :, :self._factor_order], np.s_['design', :, :self.k_factors * (1 + self.factor_lag)]],
@@ -322,6 +308,14 @@ class DynamicFactorModel(MLEModel):
         self._idx_exog = np.s_['obs_intercept', :, :]
 
     def _initialize_error_cov(self):
+        # Setup fixed components of state space matrices
+        if self._error_lag > 0:
+            k_endog = self.k_endog
+            k_factors = self.k_factors
+            _factor_order = self._factor_order
+
+            self.ssm['selection', _factor_order:_factor_order + k_endog, k_factors:k_factors + k_endog] = np.eye(k_endog)
+            
         if self.error_cov_type == 'scalar':
             self._initialize_error_cov_diagonal(scalar=True)
         elif self.error_cov_type == 'diagonal':
@@ -376,25 +370,35 @@ class DynamicFactorModel(MLEModel):
         self._idx_factor_transition = np.s_['transition', :k_factors, :factor_order * k_factors]
 
     def _initialize_error_transition(self):
-        # Initialize the appropriate situation
-        if self.error_order == 0:
-            self._initialize_error_transition_white_noise()
-        else:
-            # Generic setup fixed components of state space matrices VAR(q) for error transition
-            # (in the individual AR case, we still have the VAR(q) companion
-            # matrix structure, but force the coefficient matrices to be diagonal)
+        # Setup fixed components of state space matrices
+        if self._error_lag > 0:
             k_endog = self.k_endog
+            k_endog_q = self.k_endog_q
             _factor_order = self._factor_order
             _error_order = self._error_order
             
+            start = _factor_order
+            end = _factor_order + k_endog
+            self.ssm['design', :, start:end] = np.eye(k_endog)
+
+            for i, m in enumerate([0, 2, 3, 2, 1]): # 1 already updated above
+                start = _factor_order + i * k_endog
+                end = _factor_order + i * k_endog + k_endog_q
+                self.ssm['design', :k_endog_q, start:end] += m * np.eye(k_endog_q)
+            
+            # Generic setup fixed components of state space matrices VAR(q) for error transition
+            # (in the individual AR case, we still have the VAR(q) companion
+            # matrix structure, but force the coefficient matrices to be diagonal)
             self.ssm['transition', _factor_order + k_endog:_factor_order + _error_order,
                      _factor_order:_factor_order + _error_order - k_endog] = np.eye(_error_order - k_endog)
-
-            # Now specialized setups
-            if self.error_var:
-                self._initialize_error_transition_var()
-            else:
-                self._initialize_error_transition_individual()
+            
+        # Initialize the appropriate situation
+        if self.error_order == 0:
+            self._initialize_error_transition_white_noise()
+        elif self.error_var:
+            self._initialize_error_transition_var()
+        else:
+            self._initialize_error_transition_individual()
 
     def _initialize_error_transition_white_noise(self):
         # Initialize the parameters
@@ -461,7 +465,7 @@ class DynamicFactorModel(MLEModel):
         idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
         idx_col = np.arange(dim).reshape(-1, 1)
 
-        transform = np.zeros((self._factor_lag, dim))
+        transform = np.zeros((5 + self.factor_lag, dim))
         transform[idx_row, idx_col] = multipliers
         
         return np.dot(np.linalg.inv(transform[:dim, :]), loadings[:dim, :])
@@ -473,12 +477,12 @@ class DynamicFactorModel(MLEModel):
         idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
         idx_col = np.arange(dim).reshape(-1, 1)
 
-        transform = np.zeros((self._factor_lag, dim))
+        transform = np.zeros((5 + self.factor_lag, dim))
         transform[idx_row, idx_col] = multipliers
         
         R = np.dot(transform[dim:, :], np.linalg.inv(transform[:dim, :]))
-        R = np.concatenate((R, -np.eye(self._factor_lag - dim)), axis=1)
-        R = np.concatenate((R[None, None, :, :] * np.eye(self.k_factors)[:, :, None, None]).T, axis=-1).reshape(-1, self._factor_order)
+        R = np.concatenate((R, -np.eye(4)), axis=1)
+        R = np.concatenate((R[None, None, :, :] * np.eye(self.k_factors)[:, :, None, None]).T, axis=-1).reshape(-1, self.k_factors * (5 + self.factor_lag))
         q = np.zeros(R.shape[0])
         
         return R, q
@@ -496,12 +500,12 @@ class DynamicFactorModel(MLEModel):
             
             # Loadings for quarterly variables
             for i in range(self.k_endog_q):
-                lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(self._factor_lag)])
+                lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(5 + self.factor_lag)])
                 mod_glm = GLM(endog[:, i], lagged_factors, missing='drop')
                 res_glm = mod_glm.fit_constrained(self.loadings_constraint)
                 
-                loadings += self.loadings_basis(res_glm.params.reshape(self._factor_lag, self.k_factors)).flatten().tolist()
-                endog[:, i] = res_pca._padna(np.expand_dims(res_glm.resid_response, axis=-1), before=self.factor_lag + self._factor_lag - 1, after=self.factor_lag).flatten()
+                loadings += self.loadings_basis(res_glm.params.reshape(5 + self.factor_lag, self.k_factors)).flatten().tolist()
+                endog[:, i] = res_pca._padna(np.expand_dims(res_glm.resid_response, axis=-1), before=2 * self.factor_lag + 4, after=self.factor_lag).flatten()
             
             # Loadings for monthly variables
             for i in range(self.k_endog_q, self.k_endog):
@@ -539,8 +543,7 @@ class DynamicFactorModel(MLEModel):
             params[self._params_factor_transition] = res_factors.params.T.ravel()
 
             # Test for stationarity
-            coefficient_matrices = params[self._params_factor_transition].reshape(self.k_factors * self.factor_order, self.k_factors).T
-            coefficient_matrices = coefficient_matrices.reshape(self.k_factors, self.k_factors, self.factor_order).T
+            coefficient_matrices = params[self._params_factor_transition].reshape(self.k_factors * self.factor_order, self.k_factors).T.reshape(self.k_factors, self.k_factors, self.factor_order).T
 
             stationary = is_invertible([1] + list(-coefficient_matrices))
         elif self.k_factors > 0 and self.factor_order > 0:
@@ -569,8 +572,7 @@ class DynamicFactorModel(MLEModel):
             res_errors = mod_errors.fit(maxlags=self.error_order, ic=None, trend='n')
 
             # Test for stationarity
-            coefficient_matrices = np.array(res_errors.params.T).ravel().reshape(self.k_endog * self.error_order, self.k_endog).T
-            coefficient_matrices = coefficient_matrices.reshape(self.k_endog, self.k_endog, self.error_order).T
+            coefficient_matrices = np.array(res_errors.params.T).ravel().reshape(self.k_endog * self.error_order, self.k_endog).T.reshape(self.k_endog, self.k_endog, self.error_order).T
 
             stationary = is_invertible([1] + list(-coefficient_matrices))
             if not stationary and self.enforce_stationarity:
@@ -1032,11 +1034,15 @@ class DynamicFactorModelResults(MLEResults):
             'k_factors': self.model.k_factors,
             'factor_lag': self.model.factor_lag,
             'factor_order': self.model.factor_order,
+            '_factor_lag': self.model._factor_lag,
+            '_factor_order': self.model._factor_order,
 
             # Error-related properties
             'error_order': self.model.error_order,
             'error_var': self.model.error_var,
             'error_cov_type': self.model.error_cov_type,
+            '_error_lag': self.model._error_lag,
+            '_error_order': self.model._error_order,
 
             # Other properties
             'k_exog': self.model.k_exog,
@@ -1052,8 +1058,7 @@ class DynamicFactorModelResults(MLEResults):
             ar_params = np.array(self.params[self.model._params_factor_transition])
             k_factors = self.model.k_factors
             factor_order = self.model.factor_order
-            self.coefficient_matrices_var = ar_params.reshape(k_factors * factor_order, k_factors).T
-            self.coefficient_matrices_var = self.coefficient_matrices_var.reshape(k_factors, k_factors, factor_order).T
+            self.coefficient_matrices_var = ar_params.reshape(k_factors * factor_order, k_factors).T.reshape(k_factors, k_factors, factor_order).T
 
         self.coefficient_matrices_error = None
         if self.model.error_order > 0:
@@ -1061,8 +1066,7 @@ class DynamicFactorModelResults(MLEResults):
             k_endog = self.model.k_endog
             error_order = self.model.error_order
             if self.model.error_var:
-                self.coefficient_matrices_error = ar_params.reshape(k_endog * error_order, k_endog).T
-                self.coefficient_matrices_error = self.coefficient_matrices_error.reshape(k_endog, k_endog, error_order).T
+                self.coefficient_matrices_error = ar_params.reshape(k_endog * error_order, k_endog).T.reshape(k_endog, k_endog, error_order).T
             else:
                 mat = np.zeros((k_endog, k_endog * error_order))
                 mat[self.model._idx_error_diag] = ar_params
@@ -1123,7 +1127,8 @@ class DynamicFactorModelResults(MLEResults):
             A `k_endog` x `k_factors` array, where
             `coefficients_of_determination[i, j]` represents the :math:`R^2`
             value from a regression of factor `j`, its `factor_lag` lagged values,
-            and a constant on endogenous variable `i`.
+            and a constant on endogenous variable `i`. In the case of quarterly 
+            variables, the Cox & Snell pseudo :math:`R^2` is calculated.
 
         Notes
         -----
@@ -1145,18 +1150,39 @@ class DynamicFactorModelResults(MLEResults):
         coefficients = np.zeros((spec.k_endog, spec.k_factors))
         which = 'filtered' if self.smoothed_state is None else 'smoothed'
         
-        # TODO: Adjust for quarterly variables
         if spec.k_endog_q > 0:
-            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
-
+            warnings.warn('Calculating Cox & Snell pseudo R^2 for DynamicFactorModelMQ.')
+        
         def lag_factors(exog, lags):
             res_pca = DynamicPCA(np.random.rand(10, 10))
-            return np.hstack([res_pca._shift(exog, periods=l, pad=np.nan) for l in np.arange(lags + 1)])
+            exog = np.expand_dims(exog, axis=-1) if exog.ndim == 1 else exog
+            return np.hstack([res_pca._shift(exog, periods=l, pad=np.nan) for l in np.arange(lags)])
+
+        def loadings_constraint():
+            dim = 1 + spec.factor_lag
+            multipliers = np.array([1, 2, 3, 2, 1])
+            idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
+            idx_col = np.arange(dim).reshape(-1, 1)
+
+            transform = np.zeros((5 + spec.factor_lag, dim))
+            transform[idx_row, idx_col] = multipliers
+            
+            R = np.dot(transform[dim:, :], np.linalg.inv(transform[:dim, :]))
+            R = np.concatenate((np.zeros((R.shape[0], 1)), R, -np.eye(4)), axis=1)
+            q = np.zeros(R.shape[0])
+            
+            return R, q
 
         for i in range(spec.k_factors):
-            exog = lag_factors(self.factors[which][i], spec.factor_lag)
-            exog = add_constant(exog)
-            for j in range(spec.k_endog):
+            for j in range(spec.k_endog_q):
+                exog = lag_factors(self.factors[which][i], 5 + spec.factor_lag)
+                exog = add_constant(exog)
+                endog = self.filter_results.endog[j]
+                coefficients[j, i] = GLM(endog, exog, missing='drop').fit_constrained(loadings_constraint()).pseudo_rsquared()
+            
+            for j in range(spec.k_endog_q, spec.k_endog):
+                exog = lag_factors(self.factors[which][i], 1 + spec.factor_lag)
+                exog = add_constant(exog)
                 endog = self.filter_results.endog[j]
                 coefficients[j, i] = OLS(endog, exog, missing='drop').fit().rsquared
 
@@ -1198,10 +1224,6 @@ class DynamicFactorModelResults(MLEResults):
 
         spec = self.specification
         
-        # TODO: Adjust for quarterly variables
-        if spec.k_endog_q > 0:
-            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
-
         # Should we label endogenous variables?
         if endog_labels is None:
             endog_labels = spec.k_endog <= 5
@@ -1295,8 +1317,7 @@ class DynamicFactorModelResults(MLEResults):
             k_factors = self.model.k_factors
             factor_lag = self.model.factor_lag
             factor_order = self.model.factor_order
-            _factor_order = self.model._factor_order
-            _error_order = self.model._error_order
+            error_order = self.model.error_order
 
             # Add parameter tables for each endogenous variable
             loading_indices = indices[self.model._params_loadings]
@@ -1328,7 +1349,7 @@ class DynamicFactorModelResults(MLEResults):
             factor_masks = []
             if factor_order > 0:
                 for i in range(k_factors):
-                    factor_mask = factor_indices[i * _factor_order:(i + 1) * _factor_order]
+                    factor_mask = factor_indices[i * factor_order * k_factors:(i + 1) * factor_order * k_factors]
                     factor_masks.append(factor_mask)
 
                     # Create the table
@@ -1342,8 +1363,8 @@ class DynamicFactorModelResults(MLEResults):
                 error_indices = indices[self.model._params_error_transition]
                 for i in range(k_endog):
                     if spec.error_var:
-                        start = i * _error_order
-                        end = (i + 1) * _error_order
+                        start = i * error_order * k_endog
+                        end = (i + 1) * error_order * k_endog
                     else:
                         start = i * spec.error_order
                         end = (i + 1) * spec.error_order
@@ -1452,6 +1473,8 @@ class DynamicFactorModelOptimizer:
         self.error_cov_type = error_cov_type
 
         # Data
+        self.k_endog = endog.shape[1] if endog.ndim > 1 else 1
+        self.k_endog_m = self.k_endog - k_endog_q
         self.k_endog_q = k_endog_q
         self.endog = endog
         self.exog = exog
@@ -1459,17 +1482,50 @@ class DynamicFactorModelOptimizer:
         # Kwargs
         self.kwargs = kwargs
         
-        if k_endog_q > 0:
-            warnings.warn('Not properly configured for DynamicFactorModelMQ.')
+        if self.k_endog < 2:
+            raise ValueError('The dynamic factors model is only valid for multivariate time series.')
+        
+    def _get_residuals(self, endog, res_pca, factor_lag):
+        resids = np.zeros_like(endog)
+        
+        def loadings_constraint(factor_lag, k_factors):
+            dim = 1 + factor_lag
+            multipliers = np.array([1, 2, 3, 2, 1])
+            idx_row = np.arange(dim).reshape(-1, 1) + np.arange(multipliers.shape[0])
+            idx_col = np.arange(dim).reshape(-1, 1)
+
+            transform = np.zeros((5 + factor_lag, dim))
+            transform[idx_row, idx_col] = multipliers
+            
+            R = np.dot(transform[dim:, :], np.linalg.inv(transform[:dim, :]))
+            R = np.concatenate((R, -np.eye(4)), axis=1)
+            R = np.concatenate((R[None, None, :, :] * np.eye(k_factors)[:, :, None, None]).T, axis=-1).reshape(-1, k_factors * (5 + factor_lag))
+            q = np.zeros(R.shape[0])
+            
+            return R, q
+        
+        # Residual for quarterly variables
+        for i in range(self.k_endog_q):
+            lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(5 + factor_lag)])
+            res_glm = GLM(endog[:, i], lagged_factors, missing='drop').fit_constrained(loadings_constraint(factor_lag, res_pca.dpcs))
+            resids[:, i] = res_pca._padna(np.expand_dims(res_glm.resid_response, axis=-1), before=res_pca.M + factor_lag + 4, after=res_pca.M).flatten()
+        
+        # Residual for monthly variables
+        for i in range(self.k_endog_q, self.k_endog):
+            lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) for p in np.arange(1 + factor_lag)])
+            res_ols = OLS(endog[:, i], lagged_factors, missing='drop').fit()
+            resids[:, i] = res_pca._padna(np.expand_dims(res_ols.resid, axis=-1), before=res_pca.M + factor_lag, after=res_pca.M).flatten()
+        
+        return resids
         
     def _factor_ic(self, endog, k_factors, factor_ic):    # Bai & Ng (2002)
         if k_factors == 0: 
             return np.inf
         
         # Factor loadings (estimated via PCA)
-        factors = DynamicPCA(endog, ncomp=k_factors, M=0, missing='fill-em').factors
-        # TODO: Adjust for quarterly variables
-        error = OLS(endog, factors).fit().resid
+        res_pca = DynamicPCA(endog, ncomp=k_factors, M=0, missing='fill-em')
+        error = self._get_residuals(endog, res_pca, 0)
+        error = res_pca._dropna(error)
         mean_squared_error_ = np.mean(np.power(error, 2))
         
         T, n = endog.shape
@@ -1544,11 +1600,9 @@ class DynamicFactorModelOptimizer:
         
         # Optimize error order
         res_pca = DynamicPCA(endog, ncomp=self.k_factors, M=self.factor_lag)
-        lagged_factors = np.hstack([res_pca._shift(res_pca._factors, periods=p, pad=np.nan) 
-                                    for p in np.arange(self.factor_lag + 1)])
-        resid = OLS(endog, lagged_factors, missing='drop').fit().resid
-        resid = res_pca._padna(resid, before=self.factor_lag, after=self.factor_lag)
+        resid = self._get_residuals(endog, res_pca, self.factor_lag)
         resid = OLS(resid, exog, missing='drop').fit().resid if exog else resid
+        resid = res_pca._dropna(resid)
 
         if self.error_var:
             self.error_order = VAR(resid).fit(self.error_order_max, trend='n', ic=error_ic).k_ar
