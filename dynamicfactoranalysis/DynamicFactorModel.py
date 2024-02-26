@@ -240,9 +240,13 @@ class DynamicFactorModel(MLEModel):
         if self.k_factors >= k_endog:
             raise ValueError('Number of factors must be less than the number of endogenous variables.')
         
+        # Test when no factors
+        if k_factors == 0 and (factor_lag > 0 or factor_order > 0):
+            raise ValueError('Use factor_lag and factor_order only when k_factors > 0.')
+
         # Warning for too many factor lags
         if self._factor_lag > max(1, factor_order):
-            warnings.warn('effective factor_lag is greater than factor_order.')
+            warnings.warn('Effective factor_lag is greater than factor_order.')
 
         # Test for invalid error_cov_type
         if self.error_cov_type not in ['scalar', 'diagonal', 'unstructured']:
@@ -602,8 +606,16 @@ class DynamicFactorModel(MLEModel):
                 error_ar_params += res_error.params[:self.error_order].tolist()
                 error_cov_params += res_error.params[-1:].tolist()
 
+            # Get the error covariance parameters
+            if self.error_cov_type == 'scalar':
+                params[self._params_error_cov] = np.mean(error_cov_params)
+            elif self.error_cov_type == 'diagonal':
+                params[self._params_error_cov] = np.r_[error_cov_params]
+            elif self.error_cov_type == 'unstructured':
+                cov_factor = np.diag(np.sqrt(error_cov_params))
+                params[self._params_error_cov] = cov_factor[self._idx_lower_error_cov].ravel()
+            
             params[self._params_error_transition] = np.r_[error_ar_params]
-            params[self._params_error_cov] = np.r_[error_cov_params]
 
         return params
 
@@ -1481,9 +1493,6 @@ class DynamicFactorModelOptimizer:
         
         # Kwargs
         self.kwargs = kwargs
-        
-        if self.k_endog < 2:
-            raise ValueError('The dynamic factors model is only valid for multivariate time series.')
         
     def _get_residuals(self, endog, res_pca, factor_lag):
         resids = np.zeros_like(endog)
