@@ -1610,8 +1610,8 @@ class DynamicFactorModelOptimizer:
         # Optimize error order
         res_pca = DynamicPCA(endog, ncomp=self.k_factors, M=self.factor_lag)
         resid = self._get_residuals(endog, res_pca, self.factor_lag)
-        resid = OLS(resid, exog, missing='drop').fit().resid if exog else resid
-        resid = res_pca._dropna(resid)
+        resid = OLS(resid, exog, missing='drop').fit().resid if exog is not None else resid
+        resid = np.array(res_pca._dropna(resid))
 
         if self.error_var:
             self.error_order = VAR(resid).fit(self.error_order_max, trend='n', ic=error_ic).k_ar
